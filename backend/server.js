@@ -1,5 +1,5 @@
 const express = require('express');
-const mongoose = require('mongoose');
+const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -36,16 +36,32 @@ const allowedOrigins = [
   'http://localhost:19006',
   'http://192.168.1.241:8081',
   'http://localhost:8081',
-  'exp://192.168.1.241:8081'
+  'exp://192.168.1.241:8081',
+  'https://waffer-web-app.vercel.app',
+  'https://waffer-web-hghv0gd9q-jumla.vercel.app',
+  'https://waffer-web-fhtmxiee6-jumla.vercel.app',
+  /^https:\/\/waffer-web-.*\.vercel\.app$/
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    
+    // Check if origin matches any allowed origins (including regex patterns)
+    const isAllowed = allowedOrigins.some(allowedOrigin => {
+      if (typeof allowedOrigin === 'string') {
+        return allowedOrigin === origin;
+      } else if (allowedOrigin instanceof RegExp) {
+        return allowedOrigin.test(origin);
+      }
+      return false;
+    });
+    
+    if (isAllowed) {
       callback(null, true);
     } else {
+      console.log(`CORS blocked origin: ${origin}`);
       callback(new Error('Not allowed by CORS'));
     }
   },
@@ -61,13 +77,22 @@ if (process.env.NODE_ENV !== 'production') {
   app.use(morgan('dev'));
 }
 
-// Database connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/localoffers', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log('MongoDB connected successfully'))
-.catch(err => console.error('MongoDB connection error:', err));
+// Supabase configuration
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
+
+// Test Supabase connection
+supabase.from('users').select('count', { count: 'exact', head: true })
+  .then(({ error }) => {
+    if (error) {
+      console.error('Supabase connection error:', error.message);
+    } else {
+      console.log('Supabase connected successfully');
+    }
+  })
+  .catch(err => console.error('Supabase connection error:', err));
 
 // Routes
 app.use('/api/auth', authRoutes);

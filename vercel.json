@@ -1,0 +1,46 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "backend/server.js",
+      "use": "@vercel/node",
+      "config": {
+        "includeFiles": ["backend/**"]
+      }
+    },
+    {
+      "src": "frontend/LocalOffersApp/dist/**",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/backend/server.js"
+    },
+    {
+      "src": "/favicon.ico",
+      "dest": "/frontend/LocalOffersApp/dist/favicon.ico"
+    },
+    {
+      "src": "/_expo/(.*)",
+      "dest": "/frontend/LocalOffersApp/dist/_expo/$1"
+    },
+    {
+      "src": "/assets/(.*)",
+      "dest": "/frontend/LocalOffersApp/dist/assets/$1"
+    },
+    {
+      "src": "/node_modules/(.*)",
+      "dest": "/frontend/LocalOffersApp/dist/node_modules/$1"
+    },
+    {
+      "src": "/(.*\\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|json))",
+      "dest": "/frontend/LocalOffersApp/dist/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/frontend/LocalOffersApp/dist/index.html"
+    }
+  ]
+}

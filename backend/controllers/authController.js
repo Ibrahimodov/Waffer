@@ -1,45 +1,39 @@
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const { getSupabase } = require('../config/database');
+const bcrypt = require('bcryptjs');
 
-// Generate JWT Token
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRE || '7d'
+// Send token response
+const sendTokenResponse = (user, session, statusCode, res) => {
+  res.status(statusCode).json({
+    success: true,
+    session,
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      user_type: user.user_type,
+      is_verified: user.is_verified,
+      is_nafath_verified: user.is_nafath_verified,
+      business_name: user.business_name,
+      family_size: user.family_size,
+      city: user.city,
+      created_at: user.created_at
+    }
   });
 };
 
-// Send token response
-const sendTokenResponse = (user, statusCode, res) => {
-  const token = generateToken(user._id);
+// Helper function to get user profile from database
+const getUserProfile = async (userId) => {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('id', userId)
+    .single();
   
-  const options = {
-    expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
-    httpOnly: true
-  };
-
-  if (process.env.NODE_ENV === 'production') {
-    options.secure = true;
-  }
-
-  res.status(statusCode)
-    .cookie('token', token, options)
-    .json({
-      success: true,
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        userType: user.userType,
-        isVerified: user.isVerified,
-        isNafathVerified: user.isNafathVerified,
-        businessInfo: user.businessInfo,
-        familyInfo: user.familyInfo,
-        location: user.location
-      }
-    });
+  if (error) throw error;
+  return data;
 };
 
 // @desc    Register customer
@@ -48,6 +42,7 @@ const sendTokenResponse = (user, statusCode, res) => {
 const register = async (req, res, next) => {
   try {
     const { name, email, phone, password, location } = req.body;
+    const supabase = getSupabase();
 
     // Validate required fields
     if (!name || !email || !phone || !password) {
@@ -66,12 +61,13 @@ const register = async (req, res, next) => {
     }
 
     // Check if user already exists
-    const existingUser = await User.findOne({ 
-      $or: [{ email }, { phone }] 
-    });
+    const { data: existingUsers } = await supabase
+      .from('users')
+      .select('email, phone')
+      .or(`email.eq.${email},phone.eq.${phone}`);
     
-    if (existingUser) {
-      const field = existingUser.email === email ? 'email' : 'phone';
+    if (existingUsers && existingUsers.length > 0) {
+      const field = existingUsers[0].email === email ? 'email' : 'phone';
       return res.status(409).json({
         success: false,
         message: `User with this ${field} already exists`
@@ -80,25 +76,63 @@ const register = async (req, res, next) => {
 
     console.log(`Creating new customer account for: ${email}`);
 
-    // Create user
-    const user = await User.create({
-      name,
+    // Create user with Supabase Auth
+    const { data: authData, error: authError } = await supabase.auth.signUp({
       email,
-      phone,
       password,
-      userType: 'customer',
-      location
+      options: {
+        data: {
+          name,
+          phone,
+          user_type: 'customer',
+          city: location.city,
+          district: location.district
+        }
+      }
     });
 
-    // Generate verification token
-    const verificationToken = user.generateVerificationToken();
-    await user.save();
+    if (authError) {
+      console.error('Supabase auth error:', authError);
+      return res.status(400).json({
+        success: false,
+        message: authError.message
+      });
+    }
 
-    // TODO: Send verification email
-    console.log(`Verification token for ${email}: ${verificationToken}`);
+    // Hash password for database storage
+    const salt = await bcrypt.genSalt(12);
+    const passwordHash = await bcrypt.hash(password, salt);
+
+    // Insert user profile into database
+    const { data: userData, error: dbError } = await supabase
+      .from('users')
+      .insert({
+        id: authData.user.id,
+        name,
+        email,
+        phone,
+        password_hash: passwordHash,
+        user_type: 'customer',
+        city: location.city,
+        district: location.district,
+        latitude: location.coordinates?.latitude,
+        longitude: location.coordinates?.longitude
+      })
+      .select()
+      .single();
+
+    if (dbError) {
+      console.error('Database error:', dbError);
+      // Clean up auth user if database insert fails
+      await supabase.auth.admin.deleteUser(authData.user.id);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to create user profile'
+      });
+    }
+
     console.log(`Customer registration successful for: ${email}`);
-
-    sendTokenResponse(user, 201, res);
+    sendTokenResponse(userData, authData.session, 201, res);
   } catch (error) {
     console.error('Registration error:', error);
     next(error);
@@ -118,6 +152,7 @@ const registerShop = async (req, res, next) => {
       location, 
       businessInfo 
     } = req.body;
+    const supabase = getSupabase();
 
     // Validate required fields
     if (!name || !email || !phone || !password) {
@@ -144,20 +179,13 @@ const registerShop = async (req, res, next) => {
     }
 
     // Check if user already exists
-    const existingUser = await User.findOne({ 
-      $or: [
-        { email }, 
-        { phone },
-        { 'businessInfo.commercialRegistration': businessInfo.commercialRegistration }
-      ].filter(condition => Object.values(condition)[0]) // Filter out undefined values
-    });
+    const { data: existingUsers } = await supabase
+      .from('users')
+      .select('email, phone')
+      .or(`email.eq.${email},phone.eq.${phone}`);
     
-    if (existingUser) {
-      let field = 'email';
-      if (existingUser.phone === phone) field = 'phone';
-      if (existingUser.businessInfo?.commercialRegistration === businessInfo.commercialRegistration) {
-        field = 'commercial registration';
-      }
+    if (existingUsers && existingUsers.length > 0) {
+      const field = existingUsers[0].email === email ? 'email' : 'phone';
       return res.status(409).json({
         success: false,
         message: `Shop with this ${field} already exists`
@@ -166,26 +194,67 @@ const registerShop = async (req, res, next) => {
 
     console.log(`Creating new shop account for: ${email}`);
 
-    // Create shop user
-    const user = await User.create({
-      name,
+    // Create user with Supabase Auth
+    const { data: authData, error: authError } = await supabase.auth.signUp({
       email,
-      phone,
       password,
-      userType: 'shop',
-      location,
-      businessInfo
+      options: {
+        data: {
+          name,
+          phone,
+          user_type: 'shop',
+          city: location.city,
+          district: location.district,
+          business_name: businessInfo.businessName
+        }
+      }
     });
 
-    // Generate verification token
-    const verificationToken = user.generateVerificationToken();
-    await user.save();
+    if (authError) {
+      console.error('Supabase auth error:', authError);
+      return res.status(400).json({
+        success: false,
+        message: authError.message
+      });
+    }
 
-    // TODO: Send verification email
-    console.log(`Verification token for ${email}: ${verificationToken}`);
+    // Hash password for database storage
+    const salt = await bcrypt.genSalt(12);
+    const passwordHash = await bcrypt.hash(password, salt);
+
+    // Insert user profile into database
+    const { data: userData, error: dbError } = await supabase
+      .from('users')
+      .insert({
+        id: authData.user.id,
+        name,
+        email,
+        phone,
+        password_hash: passwordHash,
+        user_type: 'shop',
+        city: location.city,
+        district: location.district,
+        latitude: location.coordinates?.latitude,
+        longitude: location.coordinates?.longitude,
+        business_name: businessInfo.businessName,
+        business_type: businessInfo.businessType,
+        commercial_registration: businessInfo.commercialRegistration
+      })
+      .select()
+      .single();
+
+    if (dbError) {
+      console.error('Database error:', dbError);
+      // Clean up auth user if database insert fails
+      await supabase.auth.admin.deleteUser(authData.user.id);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to create user profile'
+      });
+    }
+
     console.log(`Shop registration successful for: ${email}`);
-
-    sendTokenResponse(user, 201, res);
+    sendTokenResponse(userData, authData.session, 201, res);
   } catch (error) {
     console.error('Shop registration error:', error);
     next(error);
@@ -206,6 +275,7 @@ const registerFamily = async (req, res, next) => {
       businessInfo,
       familyInfo 
     } = req.body;
+    const supabase = getSupabase();
 
     // Validate required fields
     if (!name || !email || !phone || !password) {
@@ -232,12 +302,13 @@ const registerFamily = async (req, res, next) => {
     }
 
     // Check if user already exists
-    const existingUser = await User.findOne({ 
-      $or: [{ email }, { phone }] 
-    });
+    const { data: existingUsers } = await supabase
+      .from('users')
+      .select('email, phone')
+      .or(`email.eq.${email},phone.eq.${phone}`);
     
-    if (existingUser) {
-      const field = existingUser.email === email ? 'email' : 'phone';
+    if (existingUsers && existingUsers.length > 0) {
+      const field = existingUsers[0].email === email ? 'email' : 'phone';
       return res.status(409).json({
         success: false,
         message: `Productive family with this ${field} already exists`
@@ -246,27 +317,68 @@ const registerFamily = async (req, res, next) => {
 
     console.log(`Creating new productive family account for: ${email}`);
 
-    // Create productive family user
-    const user = await User.create({
-      name,
+    // Create user with Supabase Auth
+    const { data: authData, error: authError } = await supabase.auth.signUp({
       email,
-      phone,
       password,
-      userType: 'productive_family',
-      location,
-      businessInfo,
-      familyInfo
+      options: {
+        data: {
+          name,
+          phone,
+          user_type: 'productive_family',
+          city: location.city,
+          district: location.district,
+          family_size: familyInfo.familySize
+        }
+      }
     });
 
-    // Generate verification token
-    const verificationToken = user.generateVerificationToken();
-    await user.save();
+    if (authError) {
+      console.error('Supabase auth error:', authError);
+      return res.status(400).json({
+        success: false,
+        message: authError.message
+      });
+    }
 
-    // TODO: Send verification email
-    console.log(`Verification token for ${email}: ${verificationToken}`);
+    // Hash password for database storage
+    const salt = await bcrypt.genSalt(12);
+    const passwordHash = await bcrypt.hash(password, salt);
+
+    // Insert user profile into database
+    const { data: userData, error: dbError } = await supabase
+      .from('users')
+      .insert({
+        id: authData.user.id,
+        name,
+        email,
+        phone,
+        password_hash: passwordHash,
+        user_type: 'productive_family',
+        city: location.city,
+        district: location.district,
+        latitude: location.coordinates?.latitude,
+        longitude: location.coordinates?.longitude,
+        family_size: familyInfo.familySize,
+        specialty: familyInfo.specialty,
+        years_of_experience: familyInfo.yearsOfExperience,
+        business_name: businessInfo?.businessName
+      })
+      .select()
+      .single();
+
+    if (dbError) {
+      console.error('Database error:', dbError);
+      // Clean up auth user if database insert fails
+      await supabase.auth.admin.deleteUser(authData.user.id);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to create user profile'
+      });
+    }
+
     console.log(`Productive family registration successful for: ${email}`);
-
-    sendTokenResponse(user, 201, res);
+    sendTokenResponse(userData, authData.session, 201, res);
   } catch (error) {
     console.error('Family registration error:', error);
     next(error);
@@ -279,6 +391,7 @@ const registerFamily = async (req, res, next) => {
 const login = async (req, res, next) => {
   try {
     const { email, password } = req.body;
+    const supabase = getSupabase();
 
     // Validate input
     if (!email || !password) {
@@ -289,30 +402,37 @@ const login = async (req, res, next) => {
       });
     }
 
-    // Check for user
-    const user = await User.findOne({ email }).select('+password');
+    // Sign in with Supabase Auth
+    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    });
 
-    if (!user) {
-      console.log(`Login attempt with non-existent email: ${email}`);
+    if (authError) {
+      console.log(`Login attempt failed for email: ${email} - ${authError.message}`);
       return res.status(401).json({
         success: false,
         message: 'Invalid credentials'
       });
     }
 
-    // Check if password matches
-    const isMatch = await user.comparePassword(password);
+    // Get user profile from database
+    const { data: userData, error: dbError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', authData.user.id)
+      .single();
 
-    if (!isMatch) {
-      console.log(`Login attempt with incorrect password for email: ${email}`);
-      return res.status(401).json({
+    if (dbError || !userData) {
+      console.error('Failed to fetch user profile:', dbError);
+      return res.status(500).json({
         success: false,
-        message: 'Invalid credentials'
+        message: 'Failed to fetch user profile'
       });
     }
 
     // Check if user is active
-    if (!user.isActive) {
+    if (!userData.is_active) {
       console.log(`Login attempt with deactivated account: ${email}`);
       return res.status(401).json({
         success: false,
@@ -321,7 +441,7 @@ const login = async (req, res, next) => {
     }
 
     console.log(`Successful login for user: ${email}`);
-    sendTokenResponse(user, 200, res);
+    sendTokenResponse(userData, authData.session, 200, res);
   } catch (error) {
     console.error('Login error:', error);
     next(error);
@@ -333,10 +453,18 @@ const login = async (req, res, next) => {
 // @access  Private
 const logout = async (req, res, next) => {
   try {
-    res.cookie('token', 'none', {
-      expires: new Date(Date.now() + 10 * 1000),
-      httpOnly: true
-    });
+    const supabase = getSupabase();
+    
+    // Sign out from Supabase
+    const { error } = await supabase.auth.signOut();
+    
+    if (error) {
+      console.error('Logout error:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to logout'
+      });
+    }
 
     res.status(200).json({
       success: true,
@@ -352,11 +480,24 @@ const logout = async (req, res, next) => {
 // @access  Private
 const getMe = async (req, res, next) => {
   try {
-    const user = await User.findById(req.user.id);
+    const supabase = getSupabase();
+    
+    // Get current user from Supabase Auth
+    const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
+    
+    if (authError || !authUser) {
+      return res.status(401).json({
+        success: false,
+        message: 'Not authenticated'
+      });
+    }
+    
+    // Get user profile from database
+    const userData = await getUserProfile(authUser.id);
 
     res.status(200).json({
       success: true,
-      user
+      user: userData
     });
   } catch (error) {
     next(error);
@@ -368,62 +509,105 @@ const getMe = async (req, res, next) => {
 // @access  Public
 const forgotPassword = async (req, res, next) => {
   try {
-    const user = await User.findOne({ email: req.body.email });
+    const { email } = req.body;
+    const supabase = getSupabase();
 
-    if (!user) {
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide email'
+      });
+    }
+
+    // Check if user exists in our database
+    const { data: userData, error: dbError } = await supabase
+      .from('users')
+      .select('id, email')
+      .eq('email', email)
+      .single();
+
+    if (dbError || !userData) {
+      console.log(`Password reset requested for non-existent email: ${email}`);
       return res.status(404).json({
         success: false,
         message: 'User not found'
       });
     }
 
-    // Get reset token
-    const resetToken = user.generateResetPasswordToken();
-    await user.save({ validateBeforeSave: false });
+    // Send password reset email via Supabase Auth
+    const { error: resetError } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: `${process.env.FRONTEND_URL}/reset-password`
+    });
 
-    // TODO: Send reset password email
-    console.log(`Reset token: ${resetToken}`);
+    if (resetError) {
+      console.error('Password reset error:', resetError);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to send password reset email'
+      });
+    }
+
+    console.log(`Password reset email sent to: ${email}`);
 
     res.status(200).json({
       success: true,
       message: 'Reset password email sent'
     });
   } catch (error) {
+    console.error('Forgot password error:', error);
     next(error);
   }
 };
 
 // @desc    Reset password
-// @route   PUT /api/auth/reset-password/:resettoken
+// @route   PUT /api/auth/reset-password
 // @access  Public
 const resetPassword = async (req, res, next) => {
   try {
-    // Get hashed token
-    const resetPasswordToken = crypto
-      .createHash('sha256')
-      .update(req.params.resettoken)
-      .digest('hex');
+    const { password, access_token, refresh_token } = req.body;
+    const supabase = getSupabase();
 
-    const user = await User.findOne({
-      resetPasswordToken,
-      resetPasswordExpire: { $gt: Date.now() }
-    });
-
-    if (!user) {
+    if (!password || !access_token || !refresh_token) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid or expired token'
+        message: 'Please provide password and tokens'
       });
     }
 
-    // Set new password
-    user.password = req.body.password;
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpire = undefined;
-    await user.save();
+    // Set the session with the tokens from the reset link
+    const { data: sessionData, error: sessionError } = await supabase.auth.setSession({
+      access_token,
+      refresh_token
+    });
 
-    sendTokenResponse(user, 200, res);
+    if (sessionError) {
+      console.log('Invalid or expired reset tokens');
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired tokens'
+      });
+    }
+
+    // Update the password
+    const { data: updateData, error: updateError } = await supabase.auth.updateUser({
+      password: password
+    });
+
+    if (updateError) {
+      console.error('Password update error:', updateError);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to update password'
+      });
+    }
+
+    // Get user profile
+    const userData = await getUserProfile(updateData.user.id);
+
+    console.log(`Password reset successful for user: ${updateData.user.email}`);
+    sendTokenResponse(userData, sessionData.session, 200, res);
   } catch (error) {
+    console.error('Reset password error:', error);
     next(error);
   }
 };
@@ -433,50 +617,114 @@ const resetPassword = async (req, res, next) => {
 // @access  Private
 const updatePassword = async (req, res, next) => {
   try {
-    const user = await User.findById(req.user.id).select('+password');
+    const { currentPassword, newPassword } = req.body;
+    const supabase = getSupabase();
 
-    // Check current password
-    if (!(await user.comparePassword(req.body.currentPassword))) {
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide current and new password'
+      });
+    }
+
+    // Get current user
+    const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
+    
+    if (authError || !authUser) {
+      return res.status(401).json({
+        success: false,
+        message: 'Not authenticated'
+      });
+    }
+
+    // Verify current password by attempting to sign in
+    const { error: verifyError } = await supabase.auth.signInWithPassword({
+      email: authUser.email,
+      password: currentPassword
+    });
+
+    if (verifyError) {
+      console.log(`Password update failed - incorrect current password for user: ${authUser.email}`);
       return res.status(401).json({
         success: false,
         message: 'Current password is incorrect'
       });
     }
 
-    user.password = req.body.password;
-    await user.save();
+    // Update password
+    const { data: updateData, error: updateError } = await supabase.auth.updateUser({
+      password: newPassword
+    });
 
-    sendTokenResponse(user, 200, res);
+    if (updateError) {
+      console.error('Password update error:', updateError);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to update password'
+      });
+    }
+
+    // Get user profile
+    const userData = await getUserProfile(authUser.id);
+
+    console.log(`Password updated successfully for user: ${authUser.email}`);
+    
+    // Get current session
+    const { data: { session } } = await supabase.auth.getSession();
+    sendTokenResponse(userData, session, 200, res);
   } catch (error) {
+    console.error('Update password error:', error);
     next(error);
   }
 };
 
 // @desc    Verify email
-// @route   GET /api/auth/verify-email/:token
+// @route   GET /api/auth/verify
 // @access  Public
 const verifyEmail = async (req, res, next) => {
   try {
-    const user = await User.findOne({
-      verificationToken: req.params.token
-    });
+    const { token_hash, type } = req.query;
+    const supabase = getSupabase();
 
-    if (!user) {
+    if (!token_hash || type !== 'email') {
       return res.status(400).json({
         success: false,
-        message: 'Invalid verification token'
+        message: 'Invalid verification parameters'
       });
     }
 
-    user.isVerified = true;
-    user.verificationToken = undefined;
-    await user.save();
+    // Verify the email with Supabase Auth
+    const { data, error } = await supabase.auth.verifyOtp({
+      token_hash,
+      type: 'email'
+    });
+
+    if (error) {
+      console.log(`Email verification failed: ${error.message}`);
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired verification token'
+      });
+    }
+
+    // Update user verification status in database
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ is_verified: true })
+      .eq('id', data.user.id);
+
+    if (updateError) {
+      console.error('Failed to update verification status:', updateError);
+    }
+
+    console.log(`Email verified successfully for user: ${data.user.email}`);
 
     res.status(200).json({
       success: true,
       message: 'Email verified successfully'
     });
   } catch (error) {
+    console.error('Email verification error:', error);
     next(error);
   }
 };
@@ -486,33 +734,59 @@ const verifyEmail = async (req, res, next) => {
 // @access  Public
 const resendVerification = async (req, res, next) => {
   try {
-    const user = await User.findOne({ email: req.body.email });
+    const { email } = req.body;
+    const supabase = getSupabase();
 
-    if (!user) {
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide email'
+      });
+    }
+
+    // Check if user exists and verification status
+    const { data: userData, error: dbError } = await supabase
+      .from('users')
+      .select('id, email, is_verified')
+      .eq('email', email)
+      .single();
+
+    if (dbError || !userData) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
       });
     }
 
-    if (user.isVerified) {
+    if (userData.is_verified) {
       return res.status(400).json({
         success: false,
-        message: 'Email already verified'
+        message: 'Email is already verified'
       });
     }
 
-    const verificationToken = user.generateVerificationToken();
-    await user.save();
+    // Resend verification email via Supabase Auth
+    const { error: resendError } = await supabase.auth.resend({
+      type: 'signup',
+      email: email
+    });
 
-    // TODO: Send verification email
-    console.log(`Verification token: ${verificationToken}`);
+    if (resendError) {
+      console.error('Failed to resend verification email:', resendError);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to send verification email'
+      });
+    }
+
+    console.log(`Verification email resent for: ${email}`);
 
     res.status(200).json({
       success: true,
       message: 'Verification email sent'
     });
   } catch (error) {
+    console.error('Resend verification error:', error);
     next(error);
   }
 };
@@ -523,11 +797,27 @@ const resendVerification = async (req, res, next) => {
 const nafathAuth = async (req, res, next) => {
   try {
     const { nafathId, transactionId } = req.body;
+    const supabase = getSupabase();
     
     if (!nafathId || !transactionId) {
       return res.status(400).json({
         success: false,
         message: 'Nafath ID and transaction ID are required'
+      });
+    }
+
+    // Check if user exists with this Nafath ID
+    const { data: userData, error: dbError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('nafath_id', nafathId)
+      .single();
+
+    if (dbError && dbError.code !== 'PGRST116') { // PGRST116 is "not found"
+      console.error('Database error during Nafath auth:', dbError);
+      return res.status(500).json({
+        success: false,
+        message: 'Database error'
       });
     }
     
@@ -539,7 +829,8 @@ const nafathAuth = async (req, res, next) => {
       data: {
         transactionId,
         status: 'pending',
-        redirectUrl: `/api/auth/nafath/callback?transaction=${transactionId}`
+        redirectUrl: `/api/auth/nafath/callback?transaction=${transactionId}`,
+        userExists: !!userData
       }
     });
   } catch (error) {
@@ -552,35 +843,120 @@ const nafathAuth = async (req, res, next) => {
 // @access  Public
 const nafathCallback = async (req, res, next) => {
   try {
-    const { nafathId, userData } = req.body;
+    const { nafathId, verified, userData } = req.body;
+    const supabase = getSupabase();
 
-    // Find user by email or create new one
-    let user = await User.findOne({ email: userData.email });
-
-    if (user) {
-      // Update existing user with Nafath data
-      user.nafathId = nafathId;
-      user.isNafathVerified = true;
-      user.isVerified = true;
-      await user.save();
-    } else {
-      // Create new user with Nafath data
-      user = await User.create({
-        name: userData.name,
-        email: userData.email,
-        phone: userData.phone,
-        nafathId,
-        isNafathVerified: true,
-        isVerified: true,
-        userType: 'customer',
-        location: {
-          city: userData.city || 'الرياض'
-        }
+    if (!nafathId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide Nafath ID'
       });
     }
 
-    sendTokenResponse(user, 200, res);
+    if (!verified) {
+      console.log(`Nafath verification failed for ID: ${nafathId}`);
+      return res.status(401).json({
+        success: false,
+        message: 'Nafath verification failed'
+      });
+    }
+
+    // Find user with Nafath ID
+    const { data: existingUser, error: findError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('nafath_id', nafathId)
+      .single();
+
+    let user;
+    let session;
+
+    if (findError && findError.code === 'PGRST116') {
+      // User doesn't exist, create new user
+      const { data: authData, error: authError } = await supabase.auth.signUp({
+        email: userData.email,
+        password: crypto.randomBytes(32).toString('hex'), // Generate random password
+        options: {
+          emailRedirectTo: `${process.env.FRONTEND_URL}/auth/callback`
+        }
+      });
+
+      if (authError) {
+        console.error('Failed to create auth user:', authError);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to create user account'
+        });
+      }
+
+      // Insert user profile
+      const { data: profileData, error: profileError } = await supabase
+        .from('users')
+        .insert({
+          id: authData.user.id,
+          name: userData.name,
+          email: userData.email,
+          phone: userData.phone,
+          nafath_id: nafathId,
+          is_nafath_verified: true,
+          is_verified: true,
+          user_type: 'customer',
+          city: userData.city || 'الرياض'
+        })
+        .select()
+        .single();
+
+      if (profileError) {
+        console.error('Failed to create user profile:', profileError);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to create user profile'
+        });
+      }
+
+      user = profileData;
+      session = authData.session;
+      console.log(`New user created via Nafath: ${user.email}`);
+    } else if (existingUser) {
+      // Update existing user
+      const { data: updatedUser, error: updateError } = await supabase
+        .from('users')
+        .update({
+          is_nafath_verified: true,
+          is_verified: true
+        })
+        .eq('id', existingUser.id)
+        .select()
+        .single();
+
+      if (updateError) {
+        console.error('Failed to update user:', updateError);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to update user'
+        });
+      }
+
+      // Create session for existing user
+      const { data: sessionData, error: sessionError } = await supabase.auth.admin.generateLink({
+        type: 'magiclink',
+        email: existingUser.email
+      });
+
+      user = updatedUser;
+      session = sessionData?.session;
+      console.log(`Existing user verified via Nafath: ${user.email}`);
+    } else {
+      console.error('Database error during Nafath callback:', findError);
+      return res.status(500).json({
+        success: false,
+        message: 'Database error'
+      });
+    }
+
+    sendTokenResponse(user, session, 200, res);
   } catch (error) {
+    console.error('Nafath callback error:', error);
     next(error);
   }
 };

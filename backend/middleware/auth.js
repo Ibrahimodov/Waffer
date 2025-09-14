@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const { createClient } = require('@supabase/supabase-js');
 
 // Protect routes - verify JWT token
 const protect = async (req, res, next) => {
@@ -23,10 +23,20 @@ const protect = async (req, res, next) => {
       // Verify token
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       
-      // Get user from token
-      const user = await User.findById(decoded.id).select('-password');
+      // Initialize Supabase client with service role for admin operations
+      const supabaseAdmin = createClient(
+        process.env.SUPABASE_URL,
+        process.env.SUPABASE_SERVICE_ROLE_KEY
+      );
       
-      if (!user) {
+      // Get user from token
+      const { data: user, error } = await supabaseAdmin
+        .from('users')
+        .select('*')
+        .eq('id', decoded.id)
+        .single();
+      
+      if (error || !user) {
         return res.status(401).json({
           success: false,
           message: 'User not found'
@@ -34,12 +44,15 @@ const protect = async (req, res, next) => {
       }
 
       // Check if user is active
-      if (!user.isActive) {
+      if (!user.is_active) {
         return res.status(401).json({
           success: false,
           message: 'User account is deactivated'
         });
       }
+      
+      // Remove password hash from user object
+      delete user.password_hash;
 
       req.user = user;
       next();
@@ -60,10 +73,10 @@ const protect = async (req, res, next) => {
 // Grant access to specific roles
 const authorize = (...roles) => {
   return (req, res, next) => {
-    if (!roles.includes(req.user.userType)) {
+    if (!roles.includes(req.user.user_type)) {
       return res.status(403).json({
         success: false,
-        message: `User type ${req.user.userType} is not authorized to access this route`
+        message: `User type ${req.user.user_type} is not authorized to access this route`
       });
     }
     next();
@@ -72,7 +85,7 @@ const authorize = (...roles) => {
 
 // Check if user is verified
 const requireVerification = (req, res, next) => {
-  if (!req.user.isVerified) {
+  if (!req.user.is_verified) {
     return res.status(403).json({
       success: false,
       message: 'Please verify your account to access this resource'
@@ -83,7 +96,7 @@ const requireVerification = (req, res, next) => {
 
 // Check if user has Nafath verification (for sensitive operations)
 const requireNafathVerification = (req, res, next) => {
-  if (!req.user.isNafathVerified) {
+  if (!req.user.is_nafath_verified) {
     return res.status(403).json({
       success: false,
       message: 'Nafath verification required for this operation'
@@ -104,9 +117,22 @@ const optionalAuth = async (req, res, next) => {
     if (token) {
       try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.id).select('-password');
         
-        if (user && user.isActive) {
+        // Initialize Supabase client with service role for admin operations
+        const supabaseAdmin = createClient(
+          process.env.SUPABASE_URL,
+          process.env.SUPABASE_SERVICE_ROLE_KEY
+        );
+        
+        const { data: user, error } = await supabaseAdmin
+          .from('users')
+          .select('*')
+          .eq('id', decoded.id)
+          .single();
+        
+        if (!error && user && user.is_active) {
+          // Remove password hash from user object
+          delete user.password_hash;
           req.user = user;
         }
       } catch (error) {

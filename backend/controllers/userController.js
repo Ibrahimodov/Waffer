@@ -1,4 +1,4 @@
-const User = require('../models/User');
+const { createClient } = require('@supabase/supabase-js');
 const asyncHandler = require('../middleware/asyncHandler');
 const ErrorResponse = require('../utils/errorResponse');
 
@@ -6,41 +6,48 @@ const ErrorResponse = require('../utils/errorResponse');
 // @route   GET /api/users
 // @access  Private (Admin only)
 const getUsers = asyncHandler(async (req, res, next) => {
-  const { page = 1, limit = 10, userType, search, sortBy = 'createdAt' } = req.query;
+  // Initialize Supabase client with service role for admin operations
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
   
-  let query = {};
+  const { page = 1, limit = 10, userType, search, sortBy = 'created_at' } = req.query;
+  
+  let query = supabaseAdmin.from('users').select('*', { count: 'exact' });
   
   // Filter by user type
   if (userType) {
-    query.userType = userType;
+    query = query.eq('user_type', userType);
   }
   
   // Search functionality
   if (search) {
-    query.$or = [
-      { name: { $regex: search, $options: 'i' } },
-      { email: { $regex: search, $options: 'i' } },
-      { phone: { $regex: search, $options: 'i' } }
-    ];
+    query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
   }
   
-  const users = await User.find(query)
-    .select('-password')
-    .sort({ [sortBy]: -1 })
-    .limit(limit * 1)
-    .skip((page - 1) * limit)
-    .exec();
-    
-  const total = await User.countDocuments(query);
+  // Apply sorting
+  const sortOrder = sortBy === 'created_at' ? { ascending: false } : { ascending: true };
+  query = query.order(sortBy, sortOrder);
+  
+  // Apply pagination
+  const offset = (page - 1) * limit;
+  query = query.range(offset, offset + limit - 1);
+  
+  const { data: users, error, count } = await query;
+  
+  if (error) {
+    return next(new ErrorResponse('Error fetching users', 500));
+  }
   
   res.status(200).json({
     success: true,
     count: users.length,
-    total,
+    total: count,
     pagination: {
       page: parseInt(page),
       limit: parseInt(limit),
-      pages: Math.ceil(total / limit)
+      pages: Math.ceil(count / limit)
     },
     data: users
   });
@@ -55,11 +62,24 @@ const getUser = asyncHandler(async (req, res, next) => {
     return next(new ErrorResponse('Not authorized to access this profile', 403));
   }
   
-  const user = await User.findById(req.params.id).select('-password');
+  // Initialize Supabase client with service role for admin operations
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
   
-  if (!user) {
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
+  
+  if (error || !user) {
     return next(new ErrorResponse('User not found', 404));
   }
+  
+  // Remove password hash from response
+  delete user.password_hash;
   
   res.status(200).json({
     success: true,
@@ -71,6 +91,12 @@ const getUser = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/users/profile
 // @access  Private
 const updateProfile = asyncHandler(async (req, res, next) => {
+  // Initialize Supabase client with service role for admin operations
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+  
   const fieldsToUpdate = {
     name: req.body.name,
     email: req.body.email,
@@ -84,14 +110,22 @@ const updateProfile = asyncHandler(async (req, res, next) => {
     }
   });
   
-  const user = await User.findByIdAndUpdate(
-    req.user.id,
-    fieldsToUpdate,
-    {
-      new: true,
-      runValidators: true
-    }
-  ).select('-password');
+  // Add updated timestamp
+  fieldsToUpdate.updated_at = new Date().toISOString();
+  
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .update(fieldsToUpdate)
+    .eq('id', req.user.id)
+    .select()
+    .single();
+  
+  if (error) {
+    return next(new ErrorResponse('Error updating profile', 500));
+  }
+  
+  // Remove password hash from response
+  delete user.password_hash;
   
   res.status(200).json({
     success: true,
@@ -108,13 +142,32 @@ const deleteUser = asyncHandler(async (req, res, next) => {
     return next(new ErrorResponse('Not authorized to delete this profile', 403));
   }
   
-  const user = await User.findById(req.params.id);
+  // Initialize Supabase client with service role for admin operations
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
   
-  if (!user) {
+  // Check if user exists
+  const { data: user, error: fetchError } = await supabaseAdmin
+    .from('users')
+    .select('id')
+    .eq('id', req.params.id)
+    .single();
+  
+  if (fetchError || !user) {
     return next(new ErrorResponse('User not found', 404));
   }
   
-  await user.remove();
+  // Delete the user
+  const { error: deleteError } = await supabaseAdmin
+    .from('users')
+    .delete()
+    .eq('id', req.params.id);
+  
+  if (deleteError) {
+    return next(new ErrorResponse('Error deleting user', 500));
+  }
   
   res.status(200).json({
     success: true,
@@ -126,17 +179,31 @@ const deleteUser = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/users/avatar
 // @access  Private
 const uploadAvatar = asyncHandler(async (req, res, next) => {
-  // Handle avatar upload logic here
-  // This would typically involve multer middleware and cloud storage
+  // Initialize Supabase client with service role for admin operations
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
   
-  const user = await User.findByIdAndUpdate(
-    req.user.id,
-    { avatar: req.body.avatarUrl }, // Assuming the URL is provided after upload
-    {
-      new: true,
-      runValidators: true
-    }
-  ).select('-password');
+  // Handle avatar upload logic here
+  // This would typically involve multer middleware and Supabase Storage
+  
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .update({ 
+      avatar_url: req.body.avatarUrl, // Assuming the URL is provided after upload
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', req.user.id)
+    .select()
+    .single();
+  
+  if (error) {
+    return next(new ErrorResponse('Error updating avatar', 500));
+  }
+  
+  // Remove password hash from response
+  delete user.password_hash;
   
   res.status(200).json({
     success: true,
@@ -149,28 +216,38 @@ const uploadAvatar = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/users/location
 // @access  Private
 const updateLocation = asyncHandler(async (req, res, next) => {
+  // Initialize Supabase client with service role for admin operations
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+  
   const { latitude, longitude, address, city, region } = req.body;
   
   if (!latitude || !longitude) {
     return next(new ErrorResponse('Please provide latitude and longitude', 400));
   }
   
-  const locationData = {
-    type: 'Point',
-    coordinates: [longitude, latitude],
-    address,
-    city,
-    region
-  };
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .update({
+      latitude,
+      longitude,
+      address,
+      city,
+      region,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', req.user.id)
+    .select()
+    .single();
   
-  const user = await User.findByIdAndUpdate(
-    req.user.id,
-    { location: locationData },
-    {
-      new: true,
-      runValidators: true
-    }
-  ).select('-password');
+  if (error) {
+    return next(new ErrorResponse('Error updating location', 500));
+  }
+  
+  // Remove password hash from response
+  delete user.password_hash;
   
   res.status(200).json({
     success: true,
@@ -182,18 +259,35 @@ const updateLocation = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/users/business-info
 // @access  Private (Shop owners only)
 const updateBusinessInfo = asyncHandler(async (req, res, next) => {
-  if (req.user.userType !== 'shop') {
+  if (req.user.user_type !== 'shop') {
     return next(new ErrorResponse('Only shop owners can update business info', 403));
   }
   
-  const user = await User.findByIdAndUpdate(
-    req.user.id,
-    { businessInfo: req.body },
-    {
-      new: true,
-      runValidators: true
-    }
-  ).select('-password');
+  // Initialize Supabase client with service role for admin operations
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+  
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .update({
+      business_name: req.body.businessName,
+      business_description: req.body.businessDescription,
+      business_category: req.body.businessCategory,
+      business_license: req.body.businessLicense,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', req.user.id)
+    .select()
+    .single();
+  
+  if (error) {
+    return next(new ErrorResponse('Error updating business info', 500));
+  }
+  
+  // Remove password hash from response
+  delete user.password_hash;
   
   res.status(200).json({
     success: true,
@@ -205,18 +299,34 @@ const updateBusinessInfo = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/users/family-info
 // @access  Private (Productive families only)
 const updateFamilyInfo = asyncHandler(async (req, res, next) => {
-  if (req.user.userType !== 'productive_family') {
+  if (req.user.user_type !== 'productive_family') {
     return next(new ErrorResponse('Only productive families can update family info', 403));
   }
   
-  const user = await User.findByIdAndUpdate(
-    req.user.id,
-    { familyInfo: req.body },
-    {
-      new: true,
-      runValidators: true
-    }
-  ).select('-password');
+  // Initialize Supabase client with service role for admin operations
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+  
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .update({
+      family_size: req.body.familySize,
+      family_specialty: req.body.familySpecialty,
+      family_description: req.body.familyDescription,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', req.user.id)
+    .select()
+    .single();
+  
+  if (error) {
+    return next(new ErrorResponse('Error updating family info', 500));
+  }
+  
+  // Remove password hash from response
+  delete user.password_hash;
   
   res.status(200).json({
     success: true,
@@ -228,22 +338,43 @@ const updateFamilyInfo = asyncHandler(async (req, res, next) => {
 // @route   PUT /api/users/notifications
 // @access  Private
 const updateNotificationSettings = asyncHandler(async (req, res, next) => {
+  // Initialize Supabase client with service role for admin operations
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+  
   const { emailNotifications, pushNotifications, smsNotifications } = req.body;
   
-  const notificationSettings = {
-    email: emailNotifications !== undefined ? emailNotifications : req.user.notificationSettings?.email,
-    push: pushNotifications !== undefined ? pushNotifications : req.user.notificationSettings?.push,
-    sms: smsNotifications !== undefined ? smsNotifications : req.user.notificationSettings?.sms
-  };
+  // Get current user to preserve existing notification settings
+  const { data: currentUser, error: fetchError } = await supabaseAdmin
+    .from('users')
+    .select('email_notifications, push_notifications, sms_notifications')
+    .eq('id', req.user.id)
+    .single();
   
-  const user = await User.findByIdAndUpdate(
-    req.user.id,
-    { notificationSettings },
-    {
-      new: true,
-      runValidators: true
-    }
-  ).select('-password');
+  if (fetchError) {
+    return next(new ErrorResponse('Error fetching user data', 500));
+  }
+  
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .update({
+      email_notifications: emailNotifications !== undefined ? emailNotifications : currentUser.email_notifications,
+      push_notifications: pushNotifications !== undefined ? pushNotifications : currentUser.push_notifications,
+      sms_notifications: smsNotifications !== undefined ? smsNotifications : currentUser.sms_notifications,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', req.user.id)
+    .select()
+    .single();
+  
+  if (error) {
+    return next(new ErrorResponse('Error updating notification settings', 500));
+  }
+  
+  // Remove password hash from response
+  delete user.password_hash;
   
   res.status(200).json({
     success: true,

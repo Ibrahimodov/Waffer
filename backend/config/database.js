@@ -1,34 +1,38 @@
-const mongoose = require('mongoose');
+const { createClient } = require('@supabase/supabase-js');
+
+let supabase = null;
 
 const connectDB = async () => {
   try {
-    const conn = await mongoose.connect(process.env.MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
+      throw new Error('Missing Supabase environment variables');
+    }
 
-    console.log(`MongoDB Connected: ${conn.connection.host}`);
+    supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_ANON_KEY
+    );
+
+    // Test the connection
+    const { data, error } = await supabase.from('users').select('count', { count: 'exact', head: true });
     
-    // Handle connection events
-    mongoose.connection.on('error', (err) => {
-      console.error('MongoDB connection error:', err);
-    });
+    if (error && error.code !== 'PGRST116') { // PGRST116 is "relation does not exist" which is expected for new projects
+      throw error;
+    }
 
-    mongoose.connection.on('disconnected', () => {
-      console.log('MongoDB disconnected');
-    });
-
-    // Graceful shutdown
-    process.on('SIGINT', async () => {
-      await mongoose.connection.close();
-      console.log('MongoDB connection closed through app termination');
-      process.exit(0);
-    });
-
+    console.log('Supabase Connected Successfully');
+    
   } catch (error) {
     console.error('Database connection failed:', error.message);
     process.exit(1);
   }
 };
 
-module.exports = connectDB;
+const getSupabase = () => {
+  if (!supabase) {
+    throw new Error('Supabase not initialized. Call connectDB first.');
+  }
+  return supabase;
+};
+
+module.exports = { connectDB, getSupabase };

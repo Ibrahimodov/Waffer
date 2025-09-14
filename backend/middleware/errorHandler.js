@@ -5,26 +5,16 @@ const errorHandler = (err, req, res, next) => {
   // Log error
   console.error(err);
 
-  // Mongoose bad ObjectId
-  if (err.name === 'CastError') {
-    const message = 'Resource not found';
-    error = {
-      message,
-      statusCode: 404
-    };
-  }
-
-  // Mongoose duplicate key
-  if (err.code === 11000) {
+  // Supabase errors
+  if (err.code === '23505') { // PostgreSQL unique constraint violation
     let message = 'Duplicate field value entered';
     
-    // Extract field name from error
-    const field = Object.keys(err.keyValue)[0];
-    if (field === 'email') {
+    // Extract field name from error details
+    if (err.details && err.details.includes('email')) {
       message = 'Email already exists';
-    } else if (field === 'phone') {
+    } else if (err.details && err.details.includes('phone')) {
       message = 'Phone number already exists';
-    } else if (field === 'commercialRegistration') {
+    } else if (err.details && err.details.includes('commercial_registration')) {
       message = 'Commercial registration number already exists';
     }
     
@@ -34,12 +24,20 @@ const errorHandler = (err, req, res, next) => {
     };
   }
 
-  // Mongoose validation error
-  if (err.name === 'ValidationError') {
-    const message = Object.values(err.errors).map(val => val.message).join(', ');
+  // Supabase/PostgreSQL validation errors
+  if (err.code === '23502') { // NOT NULL constraint violation
+    const message = 'Required field is missing';
     error = {
       message,
       statusCode: 400
+    };
+  }
+
+  // Supabase auth errors
+  if (err.message && err.message.includes('Invalid login credentials')) {
+    error = {
+      message: 'Invalid login credentials',
+      statusCode: 401
     };
   }
 

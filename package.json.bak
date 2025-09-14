@@ -1,0 +1,31 @@
+{
+  "name": "localoffers-app",
+  "version": "1.0.0",
+  "description": "Local Offers App - Frontend and Backend",
+  "main": "index.js",
+  "scripts": {
+    "start": "concurrently \"npm run start:backend\" \"npm run start:frontend\"",
+    "start:backend": "cd backend && npm start",
+    "start:frontend": "cd frontend/LocalOffersApp && npm start",
+    "install:all": "npm install && cd backend && npm install && cd ../frontend/LocalOffersApp && npm install",
+    "dev": "concurrently \"npm run start:backend\" \"npm run start:frontend\"",
+    "test": "concurrently \"npm run test:backend\" \"npm run test:frontend\"",
+    "test:backend": "cd backend && npm test -- --passWithNoTests",
+    "test:frontend": "cd frontend/LocalOffersApp && npm test -- --passWithNoTests",
+    "lint": "concurrently \"npm run lint:backend\" \"npm run lint:frontend\"",
+    "lint:backend": "cd backend && npm run lint",
+    "lint:frontend": "cd frontend/LocalOffersApp && npm run lint"
+  },
+  "keywords": [
+    "react-native",
+    "nodejs",
+    "express",
+    "mongodb",
+    "local-offers"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^7.6.0"
+  }
+}
