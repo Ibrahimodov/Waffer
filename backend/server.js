@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const { connectDB } = require('./config/database');
 require('dotenv').config();
 
 // Import routes
@@ -77,22 +78,8 @@ if (process.env.NODE_ENV !== 'production') {
   app.use(morgan('dev'));
 }
 
-// Supabase configuration
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
-
-// Test Supabase connection
-supabase.from('users').select('count', { count: 'exact', head: true })
-  .then(({ error }) => {
-    if (error) {
-      console.error('Supabase connection error:', error.message);
-    } else {
-      console.log('Supabase connected successfully');
-    }
-  })
-  .catch(err => console.error('Supabase connection error:', err));
+// Initialize Supabase connection
+connectDB();
 
 // Routes
 app.use('/api/auth', authRoutes);

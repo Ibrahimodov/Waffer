@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS public.users (
     email VARCHAR(255) UNIQUE NOT NULL,
     name VARCHAR(255) NOT NULL,
     phone VARCHAR(20),
+    user_type VARCHAR(50) DEFAULT 'customer', -- 'customer', 'shop_owner', 'admin'
     address TEXT,
     city VARCHAR(100),
     state VARCHAR(100),

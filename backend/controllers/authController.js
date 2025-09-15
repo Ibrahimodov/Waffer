@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const { getSupabase } = require('../config/database');
 const bcrypt = require('bcryptjs');
+const ValidationUtils = require('../utils/validation');
 
 // Send token response
 const sendTokenResponse = (user, session, statusCode, res) => {
@@ -44,95 +45,240 @@ const register = async (req, res, next) => {
     const { name, email, phone, password, location } = req.body;
     const supabase = getSupabase();
 
-    // Validate required fields
-    if (!name || !email || !phone || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide all required fields: name, email, phone, password'
-      });
-    }
-
-    // Validate location
-    if (!location || !location.city) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide location with city'
-      });
-    }
-
-    // Check if user already exists
-    const { data: existingUsers } = await supabase
-      .from('users')
-      .select('email, phone')
-      .or(`email.eq.${email},phone.eq.${phone}`);
-    
-    if (existingUsers && existingUsers.length > 0) {
-      const field = existingUsers[0].email === email ? 'email' : 'phone';
-      return res.status(409).json({
-        success: false,
-        message: `User with this ${field} already exists`
-      });
-    }
-
-    console.log(`Creating new customer account for: ${email}`);
-
-    // Create user with Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.signUp({
+    // Use centralized validation utilities
+    const validation = ValidationUtils.validateRegistrationData({
+      name,
       email,
+      phone,
       password,
-      options: {
-        data: {
-          name,
-          phone,
-          user_type: 'customer',
-          city: location.city,
-          district: location.district
-        }
-      }
-    });
-
-    if (authError) {
-      console.error('Supabase auth error:', authError);
+      location
+    }, 'customer');
+    
+    if (!validation.isValid) {
       return res.status(400).json({
         success: false,
-        message: authError.message
+        message: 'Validation failed',
+        errorCode: 'VALIDATION_ERROR',
+        errors: validation.errors
       });
     }
+    
+    const sanitizedData = {
+      name: validation.sanitized.name,
+      email: validation.sanitized.email,
+      phone: validation.sanitized.phone,
+      password: password,
+      city: validation.sanitized.location.city,
+      district: validation.sanitized.location.district || null,
+      coordinates: validation.sanitized.location.coordinates || null
+    };
 
-    // Hash password for database storage
-    const salt = await bcrypt.genSalt(12);
-    const passwordHash = await bcrypt.hash(password, salt);
-
-    // Insert user profile into database
-    const { data: userData, error: dbError } = await supabase
-      .from('users')
-      .insert({
-        id: authData.user.id,
-        name,
-        email,
-        phone,
-        password_hash: passwordHash,
-        user_type: 'customer',
-        city: location.city,
-        district: location.district,
-        latitude: location.coordinates?.latitude,
-        longitude: location.coordinates?.longitude
-      })
-      .select()
-      .single();
-
-    if (dbError) {
-      console.error('Database error:', dbError);
-      // Clean up auth user if database insert fails
-      await supabase.auth.admin.deleteUser(authData.user.id);
+    // Check if user already exists with enhanced error handling
+    try {
+      const { data: existingUsers, error: checkError } = await supabase
+        .from('users')
+        .select('email, phone')
+        .or(`email.eq.${sanitizedData.email},phone.eq.${sanitizedData.phone}`);
+      
+      if (checkError) {
+        console.error('Database check error:', checkError);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to verify user uniqueness',
+          errorCode: 'DATABASE_CHECK_ERROR'
+        });
+      }
+      
+      if (existingUsers && existingUsers.length > 0) {
+        const existingUser = existingUsers[0];
+        const field = existingUser.email === sanitizedData.email ? 'email' : 'phone';
+        return res.status(409).json({
+          success: false,
+          message: `User with this ${field} already exists`,
+          errorCode: 'USER_ALREADY_EXISTS',
+          conflictField: field
+        });
+      }
+    } catch (dbError) {
+      console.error('Database connection error:', dbError);
       return res.status(500).json({
         success: false,
-        message: 'Failed to create user profile'
+        message: 'Database connection failed',
+        errorCode: 'DATABASE_CONNECTION_ERROR'
       });
     }
 
-    console.log(`Customer registration successful for: ${email}`);
-    sendTokenResponse(userData, authData.session, 201, res);
+    console.log(`Creating new customer account for: ${sanitizedData.email}`);
+
+    // Create user with Supabase Auth with enhanced error handling
+    let authData;
+    try {
+      const { data, error: authError } = await supabase.auth.signUp({
+        email: sanitizedData.email,
+        password: sanitizedData.password,
+        options: {
+          data: {
+            name: sanitizedData.name,
+            phone: sanitizedData.phone,
+            user_type: 'customer',
+            city: sanitizedData.city,
+            district: sanitizedData.district
+          }
+        }
+      });
+
+      if (authError) {
+        console.error('Supabase auth error:', authError);
+        
+        // Handle specific auth errors
+        if (authError.message.includes('Email address') && authError.message.includes('invalid')) {
+          return res.status(400).json({
+            success: false,
+            message: 'Email address is invalid. Please configure custom SMTP or use a valid email domain.',
+            errorCode: 'INVALID_EMAIL_DOMAIN',
+            details: 'Default SMTP only allows team member emails. Configure custom SMTP in Supabase dashboard.'
+          });
+        }
+        
+        if (authError.message.includes('Password should be at least')) {
+          return res.status(400).json({
+            success: false,
+            message: 'Password must be at least 6 characters long',
+            errorCode: 'WEAK_PASSWORD'
+          });
+        }
+        
+        if (authError.message.includes('Signup is disabled')) {
+          return res.status(503).json({
+            success: false,
+            message: 'User registration is currently disabled',
+            errorCode: 'SIGNUP_DISABLED'
+          });
+        }
+        
+        if (authError.message.includes('rate limit')) {
+          return res.status(429).json({
+            success: false,
+            message: 'Too many registration attempts. Please try again later.',
+            errorCode: 'RATE_LIMIT_EXCEEDED'
+          });
+        }
+        
+        return res.status(400).json({
+          success: false,
+          message: authError.message || 'Authentication service error',
+          errorCode: 'AUTH_SERVICE_ERROR'
+        });
+      }
+      
+      authData = data;
+    } catch (authException) {
+      console.error('Auth service exception:', authException);
+      return res.status(500).json({
+        success: false,
+        message: 'Authentication service unavailable',
+        errorCode: 'AUTH_SERVICE_UNAVAILABLE'
+      });
+    }
+
+    // Hash password for database storage with error handling
+    let passwordHash;
+    try {
+      const salt = await bcrypt.genSalt(12);
+      passwordHash = await bcrypt.hash(sanitizedData.password, salt);
+    } catch (hashError) {
+      console.error('Password hashing error:', hashError);
+      // Clean up auth user if password hashing fails
+      try {
+        await supabase.auth.admin.deleteUser(authData.user.id);
+      } catch (cleanupError) {
+        console.error('Failed to cleanup auth user:', cleanupError);
+      }
+      return res.status(500).json({
+        success: false,
+        message: 'Password processing failed',
+        errorCode: 'PASSWORD_HASH_ERROR'
+      });
+    }
+
+    // Insert user profile into database with enhanced error handling
+    try {
+      const { data: userData, error: dbError } = await supabase
+        .from('users')
+        .insert({
+          id: authData.user.id,
+          name: sanitizedData.name,
+          email: sanitizedData.email,
+          phone: sanitizedData.phone,
+          password_hash: passwordHash,
+          user_type: 'customer',
+          city: sanitizedData.city,
+          district: sanitizedData.district,
+          latitude: location.coordinates?.latitude || null,
+          longitude: location.coordinates?.longitude || null,
+          is_active: true,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+        .select()
+        .single();
+
+      if (dbError) {
+        console.error('Database insertion error:', dbError);
+        
+        // Clean up auth user if database insert fails
+        try {
+          await supabase.auth.admin.deleteUser(authData.user.id);
+        } catch (cleanupError) {
+          console.error('Failed to cleanup auth user after DB error:', cleanupError);
+        }
+        
+        // Handle specific database errors
+        if (dbError.code === '23505') { // Unique constraint violation
+          return res.status(409).json({
+            success: false,
+            message: 'User with this email or phone already exists',
+            errorCode: 'DUPLICATE_USER_DATA'
+          });
+        }
+        
+        if (dbError.code === '23502') { // Not null violation
+          return res.status(400).json({
+            success: false,
+            message: 'Required user information is missing',
+            errorCode: 'MISSING_USER_DATA'
+          });
+        }
+        
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to create user profile',
+          errorCode: 'DATABASE_INSERT_ERROR'
+        });
+      }
+
+      console.log(`Customer registration successful for: ${sanitizedData.email}`);
+      
+      // Remove sensitive data before sending response
+      const { password_hash, ...safeUserData } = userData;
+      
+      sendTokenResponse(safeUserData, authData.session, 201, res);
+    } catch (dbException) {
+      console.error('Database service exception:', dbException);
+      
+      // Clean up auth user if database service fails
+      try {
+        await supabase.auth.admin.deleteUser(authData.user.id);
+      } catch (cleanupError) {
+        console.error('Failed to cleanup auth user after DB exception:', cleanupError);
+      }
+      
+      return res.status(500).json({
+        success: false,
+        message: 'Database service unavailable',
+        errorCode: 'DATABASE_SERVICE_UNAVAILABLE'
+      });
+    }
   } catch (error) {
     console.error('Registration error:', error);
     next(error);
@@ -154,107 +300,248 @@ const registerShop = async (req, res, next) => {
     } = req.body;
     const supabase = getSupabase();
 
-    // Validate required fields
-    if (!name || !email || !phone || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide all required fields: name, email, phone, password'
-      });
-    }
-
-    // Validate location
-    if (!location || !location.city) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide location with city'
-      });
-    }
-
-    // Validate business info
-    if (!businessInfo || !businessInfo.businessName) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide business information with business name'
-      });
-    }
-
-    // Check if user already exists
-    const { data: existingUsers } = await supabase
-      .from('users')
-      .select('email, phone')
-      .or(`email.eq.${email},phone.eq.${phone}`);
-    
-    if (existingUsers && existingUsers.length > 0) {
-      const field = existingUsers[0].email === email ? 'email' : 'phone';
-      return res.status(409).json({
-        success: false,
-        message: `Shop with this ${field} already exists`
-      });
-    }
-
-    console.log(`Creating new shop account for: ${email}`);
-
-    // Create user with Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.signUp({
+    // Use centralized validation utilities
+    const validation = ValidationUtils.validateRegistrationData({
+      name,
       email,
+      phone,
       password,
-      options: {
-        data: {
-          name,
-          phone,
-          user_type: 'shop',
-          city: location.city,
-          district: location.district,
-          business_name: businessInfo.businessName
-        }
-      }
-    });
-
-    if (authError) {
-      console.error('Supabase auth error:', authError);
+      location,
+      businessInfo
+    }, 'shop');
+    
+    if (!validation.isValid) {
       return res.status(400).json({
         success: false,
-        message: authError.message
+        message: 'Validation failed',
+        errorCode: 'VALIDATION_ERROR',
+        errors: validation.errors
       });
     }
+    
+    const sanitizedData = {
+      name: validation.sanitized.name,
+      email: validation.sanitized.email,
+      phone: validation.sanitized.phone,
+      password: password,
+      city: validation.sanitized.location.city,
+      district: validation.sanitized.location.district || null,
+      businessName: validation.sanitized.businessInfo.businessName,
+      businessType: validation.sanitized.businessInfo.businessType || null,
+      commercialRegistration: validation.sanitized.businessInfo.commercialRegistration || null,
+      coordinates: validation.sanitized.location.coordinates || null
+    };
 
-    // Hash password for database storage
-    const salt = await bcrypt.genSalt(12);
-    const passwordHash = await bcrypt.hash(password, salt);
-
-    // Insert user profile into database
-    const { data: userData, error: dbError } = await supabase
-      .from('users')
-      .insert({
-        id: authData.user.id,
-        name,
-        email,
-        phone,
-        password_hash: passwordHash,
-        user_type: 'shop',
-        city: location.city,
-        district: location.district,
-        latitude: location.coordinates?.latitude,
-        longitude: location.coordinates?.longitude,
-        business_name: businessInfo.businessName,
-        business_type: businessInfo.businessType,
-        commercial_registration: businessInfo.commercialRegistration
-      })
-      .select()
-      .single();
-
-    if (dbError) {
-      console.error('Database error:', dbError);
-      // Clean up auth user if database insert fails
-      await supabase.auth.admin.deleteUser(authData.user.id);
+    // Check if user already exists with enhanced error handling
+    try {
+      const { data: existingUsers, error: queryError } = await supabase
+        .from('users')
+        .select('email, phone, user_type')
+        .or(`email.eq.${sanitizedData.email},phone.eq.${sanitizedData.phone}`);
+      
+      if (queryError) {
+        console.error('Database query error:', queryError);
+        return res.status(500).json({
+          success: false,
+          message: 'Database service error',
+          errorCode: 'DATABASE_QUERY_ERROR'
+        });
+      }
+      
+      if (existingUsers && existingUsers.length > 0) {
+        const existingUser = existingUsers[0];
+        const field = existingUser.email === sanitizedData.email ? 'email' : 'phone';
+        return res.status(409).json({
+          success: false,
+          message: `Shop with this ${field} already exists`,
+          errorCode: 'DUPLICATE_SHOP_DATA',
+          field: field
+        });
+      }
+    } catch (queryException) {
+      console.error('Database service exception:', queryException);
       return res.status(500).json({
         success: false,
-        message: 'Failed to create user profile'
+        message: 'Database service unavailable',
+        errorCode: 'DATABASE_SERVICE_UNAVAILABLE'
       });
     }
 
-    console.log(`Shop registration successful for: ${email}`);
-    sendTokenResponse(userData, authData.session, 201, res);
+    console.log(`Creating new shop account for: ${sanitizedData.email}`);
+
+    // Create user with Supabase Auth with enhanced error handling
+    let authData;
+    try {
+      const { data, error: authError } = await supabase.auth.signUp({
+        email: sanitizedData.email,
+        password: sanitizedData.password,
+        options: {
+          data: {
+            name: sanitizedData.name,
+            phone: sanitizedData.phone,
+            user_type: 'shop',
+            city: sanitizedData.city,
+            district: sanitizedData.district,
+            business_name: sanitizedData.businessName
+          }
+        }
+      });
+
+      if (authError) {
+        console.error('Supabase auth error:', authError);
+        
+        // Handle specific auth errors
+        if (authError.message.includes('Email address') && authError.message.includes('invalid')) {
+          return res.status(400).json({
+            success: false,
+            message: 'Email address is invalid. Please configure custom SMTP or use a valid email domain.',
+            errorCode: 'INVALID_EMAIL_DOMAIN',
+            details: 'Default SMTP only allows team member emails. Configure custom SMTP in Supabase dashboard.'
+          });
+        }
+        
+        if (authError.message.includes('Password should be at least')) {
+          return res.status(400).json({
+            success: false,
+            message: 'Password must be at least 6 characters long',
+            errorCode: 'WEAK_PASSWORD'
+          });
+        }
+        
+        if (authError.message.includes('Signup is disabled')) {
+          return res.status(503).json({
+            success: false,
+            message: 'Shop registration is currently disabled',
+            errorCode: 'SIGNUP_DISABLED'
+          });
+        }
+        
+        if (authError.message.includes('rate limit')) {
+          return res.status(429).json({
+            success: false,
+            message: 'Too many registration attempts. Please try again later.',
+            errorCode: 'RATE_LIMIT_EXCEEDED'
+          });
+        }
+        
+        return res.status(400).json({
+          success: false,
+          message: authError.message || 'Authentication service error',
+          errorCode: 'AUTH_SERVICE_ERROR'
+        });
+      }
+      
+      authData = data;
+    } catch (authException) {
+      console.error('Auth service exception:', authException);
+      return res.status(500).json({
+        success: false,
+        message: 'Authentication service unavailable',
+        errorCode: 'AUTH_SERVICE_UNAVAILABLE'
+      });
+    }
+
+    // Hash password for database storage with error handling
+    let passwordHash;
+    try {
+      const salt = await bcrypt.genSalt(12);
+      passwordHash = await bcrypt.hash(sanitizedData.password, salt);
+    } catch (hashError) {
+      console.error('Password hashing error:', hashError);
+      // Clean up auth user if password hashing fails
+      try {
+        await supabase.auth.admin.deleteUser(authData.user.id);
+      } catch (cleanupError) {
+        console.error('Failed to cleanup auth user:', cleanupError);
+      }
+      return res.status(500).json({
+        success: false,
+        message: 'Password processing failed',
+        errorCode: 'PASSWORD_HASH_ERROR'
+      });
+    }
+
+    // Insert user profile into database with enhanced error handling
+    try {
+      const { data: userData, error: dbError } = await supabase
+        .from('users')
+        .insert({
+          id: authData.user.id,
+          name: sanitizedData.name,
+          email: sanitizedData.email,
+          phone: sanitizedData.phone,
+          password_hash: passwordHash,
+          user_type: 'shop',
+          city: sanitizedData.city,
+          district: sanitizedData.district,
+          latitude: location.coordinates?.latitude || null,
+          longitude: location.coordinates?.longitude || null,
+          business_name: sanitizedData.businessName,
+          business_type: sanitizedData.businessType,
+          commercial_registration: sanitizedData.commercialRegistration,
+          is_active: true,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+        .select()
+        .single();
+
+      if (dbError) {
+        console.error('Database insertion error:', dbError);
+        
+        // Clean up auth user if database insert fails
+        try {
+          await supabase.auth.admin.deleteUser(authData.user.id);
+        } catch (cleanupError) {
+          console.error('Failed to cleanup auth user after DB error:', cleanupError);
+        }
+        
+        // Handle specific database errors
+        if (dbError.code === '23505') { // Unique constraint violation
+          return res.status(409).json({
+            success: false,
+            message: 'Shop with this email or phone already exists',
+            errorCode: 'DUPLICATE_SHOP_DATA'
+          });
+        }
+        
+        if (dbError.code === '23502') { // Not null violation
+          return res.status(400).json({
+            success: false,
+            message: 'Required shop information is missing',
+            errorCode: 'MISSING_SHOP_DATA'
+          });
+        }
+        
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to create shop profile',
+          errorCode: 'DATABASE_INSERT_ERROR'
+        });
+      }
+
+      console.log(`Shop registration successful for: ${sanitizedData.email}`);
+      
+      // Remove sensitive data before sending response
+      const { password_hash, ...safeUserData } = userData;
+      
+      sendTokenResponse(safeUserData, authData.session, 201, res);
+    } catch (dbException) {
+      console.error('Database service exception:', dbException);
+      
+      // Clean up auth user if database service fails
+      try {
+        await supabase.auth.admin.deleteUser(authData.user.id);
+      } catch (cleanupError) {
+        console.error('Failed to cleanup auth user after DB exception:', cleanupError);
+      }
+      
+      return res.status(500).json({
+        success: false,
+        message: 'Database service unavailable',
+        errorCode: 'DATABASE_SERVICE_UNAVAILABLE'
+      });
+    }
   } catch (error) {
     console.error('Shop registration error:', error);
     next(error);
@@ -277,108 +564,251 @@ const registerFamily = async (req, res, next) => {
     } = req.body;
     const supabase = getSupabase();
 
-    // Validate required fields
-    if (!name || !email || !phone || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide all required fields: name, email, phone, password'
-      });
-    }
-
-    // Validate location
-    if (!location || !location.city) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide location with city'
-      });
-    }
-
-    // Validate family info
-    if (!familyInfo || !familyInfo.familySize) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide family information with family size'
-      });
-    }
-
-    // Check if user already exists
-    const { data: existingUsers } = await supabase
-      .from('users')
-      .select('email, phone')
-      .or(`email.eq.${email},phone.eq.${phone}`);
-    
-    if (existingUsers && existingUsers.length > 0) {
-      const field = existingUsers[0].email === email ? 'email' : 'phone';
-      return res.status(409).json({
-        success: false,
-        message: `Productive family with this ${field} already exists`
-      });
-    }
-
-    console.log(`Creating new productive family account for: ${email}`);
-
-    // Create user with Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.signUp({
+    // Use centralized validation utilities
+    const validation = ValidationUtils.validateRegistrationData({
+      name,
       email,
+      phone,
       password,
-      options: {
-        data: {
-          name,
-          phone,
-          user_type: 'productive_family',
-          city: location.city,
-          district: location.district,
-          family_size: familyInfo.familySize
-        }
-      }
-    });
-
-    if (authError) {
-      console.error('Supabase auth error:', authError);
+      location,
+      businessInfo,
+      familyInfo
+    }, 'productive_family');
+    
+    if (!validation.isValid) {
       return res.status(400).json({
         success: false,
-        message: authError.message
+        message: 'Validation failed',
+        errorCode: 'VALIDATION_ERROR',
+        errors: validation.errors
       });
     }
+    
+    const sanitizedData = {
+      name: validation.sanitized.name,
+      email: validation.sanitized.email,
+      phone: validation.sanitized.phone,
+      password: password,
+      city: validation.sanitized.location.city,
+      district: validation.sanitized.location.district || null,
+      familySize: validation.sanitized.familyInfo.familySize,
+      specialty: validation.sanitized.familyInfo.specialty || null,
+      yearsOfExperience: validation.sanitized.familyInfo.yearsOfExperience || null,
+      businessName: validation.sanitized.businessInfo?.businessName || null,
+      coordinates: validation.sanitized.location.coordinates || null
+    };
 
-    // Hash password for database storage
-    const salt = await bcrypt.genSalt(12);
-    const passwordHash = await bcrypt.hash(password, salt);
-
-    // Insert user profile into database
-    const { data: userData, error: dbError } = await supabase
-      .from('users')
-      .insert({
-        id: authData.user.id,
-        name,
-        email,
-        phone,
-        password_hash: passwordHash,
-        user_type: 'productive_family',
-        city: location.city,
-        district: location.district,
-        latitude: location.coordinates?.latitude,
-        longitude: location.coordinates?.longitude,
-        family_size: familyInfo.familySize,
-        specialty: familyInfo.specialty,
-        years_of_experience: familyInfo.yearsOfExperience,
-        business_name: businessInfo?.businessName
-      })
-      .select()
-      .single();
-
-    if (dbError) {
-      console.error('Database error:', dbError);
-      // Clean up auth user if database insert fails
-      await supabase.auth.admin.deleteUser(authData.user.id);
+    // Check if user already exists with enhanced error handling
+    try {
+      const { data: existingUsers, error: queryError } = await supabase
+        .from('users')
+        .select('email, phone, user_type')
+        .or(`email.eq.${sanitizedData.email},phone.eq.${sanitizedData.phone}`);
+      
+      if (queryError) {
+        console.error('Database query error:', queryError);
+        return res.status(500).json({
+          success: false,
+          message: 'Database service error',
+          errorCode: 'DATABASE_QUERY_ERROR'
+        });
+      }
+      
+      if (existingUsers && existingUsers.length > 0) {
+        const existingUser = existingUsers[0];
+        const field = existingUser.email === sanitizedData.email ? 'email' : 'phone';
+        return res.status(409).json({
+          success: false,
+          message: `Productive family with this ${field} already exists`,
+          errorCode: 'DUPLICATE_FAMILY_DATA',
+          field: field
+        });
+      }
+    } catch (queryException) {
+      console.error('Database service exception:', queryException);
       return res.status(500).json({
         success: false,
-        message: 'Failed to create user profile'
+        message: 'Database service unavailable',
+        errorCode: 'DATABASE_SERVICE_UNAVAILABLE'
       });
     }
 
-    console.log(`Productive family registration successful for: ${email}`);
-    sendTokenResponse(userData, authData.session, 201, res);
+    console.log(`Creating new productive family account for: ${sanitizedData.email}`);
+
+    // Create user with Supabase Auth with enhanced error handling
+    let authData;
+    try {
+      const { data, error: authError } = await supabase.auth.signUp({
+        email: sanitizedData.email,
+        password: sanitizedData.password,
+        options: {
+          data: {
+            name: sanitizedData.name,
+            phone: sanitizedData.phone,
+            user_type: 'productive_family',
+            city: sanitizedData.city,
+            district: sanitizedData.district,
+            family_size: sanitizedData.familySize
+          }
+        }
+      });
+
+      if (authError) {
+        console.error('Supabase auth error:', authError);
+        
+        // Handle specific auth errors
+        if (authError.message.includes('Email address') && authError.message.includes('invalid')) {
+          return res.status(400).json({
+            success: false,
+            message: 'Email address is invalid. Please configure custom SMTP or use a valid email domain.',
+            errorCode: 'INVALID_EMAIL_DOMAIN',
+            details: 'Default SMTP only allows team member emails. Configure custom SMTP in Supabase dashboard.'
+          });
+        }
+        
+        if (authError.message.includes('Password should be at least')) {
+          return res.status(400).json({
+            success: false,
+            message: 'Password must be at least 6 characters long',
+            errorCode: 'WEAK_PASSWORD'
+          });
+        }
+        
+        if (authError.message.includes('Signup is disabled')) {
+          return res.status(503).json({
+            success: false,
+            message: 'Family registration is currently disabled',
+            errorCode: 'SIGNUP_DISABLED'
+          });
+        }
+        
+        if (authError.message.includes('rate limit')) {
+          return res.status(429).json({
+            success: false,
+            message: 'Too many registration attempts. Please try again later.',
+            errorCode: 'RATE_LIMIT_EXCEEDED'
+          });
+        }
+        
+        return res.status(400).json({
+          success: false,
+          message: authError.message || 'Authentication service error',
+          errorCode: 'AUTH_SERVICE_ERROR'
+        });
+      }
+      
+      authData = data;
+    } catch (authException) {
+      console.error('Auth service exception:', authException);
+      return res.status(500).json({
+        success: false,
+        message: 'Authentication service unavailable',
+        errorCode: 'AUTH_SERVICE_UNAVAILABLE'
+      });
+    }
+
+    // Hash password for database storage with error handling
+    let passwordHash;
+    try {
+      const salt = await bcrypt.genSalt(12);
+      passwordHash = await bcrypt.hash(sanitizedData.password, salt);
+    } catch (hashError) {
+      console.error('Password hashing error:', hashError);
+      // Clean up auth user if password hashing fails
+      try {
+        await supabase.auth.admin.deleteUser(authData.user.id);
+      } catch (cleanupError) {
+        console.error('Failed to cleanup auth user:', cleanupError);
+      }
+      return res.status(500).json({
+        success: false,
+        message: 'Password processing failed',
+        errorCode: 'PASSWORD_HASH_ERROR'
+      });
+    }
+
+    // Insert user profile into database with enhanced error handling
+    try {
+      const { data: userData, error: dbError } = await supabase
+        .from('users')
+        .insert({
+          id: authData.user.id,
+          name: sanitizedData.name,
+          email: sanitizedData.email,
+          phone: sanitizedData.phone,
+          password_hash: passwordHash,
+          user_type: 'productive_family',
+          city: sanitizedData.city,
+          district: sanitizedData.district,
+          latitude: location.coordinates?.latitude || null,
+          longitude: location.coordinates?.longitude || null,
+          family_size: sanitizedData.familySize,
+          specialty: sanitizedData.specialty,
+          years_of_experience: sanitizedData.yearsOfExperience,
+          business_name: sanitizedData.businessName,
+          is_active: true,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+        .select()
+        .single();
+
+      if (dbError) {
+        console.error('Database insertion error:', dbError);
+        
+        // Clean up auth user if database insert fails
+        try {
+          await supabase.auth.admin.deleteUser(authData.user.id);
+        } catch (cleanupError) {
+          console.error('Failed to cleanup auth user after DB error:', cleanupError);
+        }
+        
+        // Handle specific database errors
+        if (dbError.code === '23505') { // Unique constraint violation
+          return res.status(409).json({
+            success: false,
+            message: 'Productive family with this email or phone already exists',
+            errorCode: 'DUPLICATE_FAMILY_DATA'
+          });
+        }
+        
+        if (dbError.code === '23502') { // Not null violation
+          return res.status(400).json({
+            success: false,
+            message: 'Required family information is missing',
+            errorCode: 'MISSING_FAMILY_DATA'
+          });
+        }
+        
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to create family profile',
+          errorCode: 'DATABASE_INSERT_ERROR'
+        });
+      }
+
+      console.log(`Productive family registration successful for: ${sanitizedData.email}`);
+      
+      // Remove sensitive data before sending response
+      const { password_hash, ...safeUserData } = userData;
+      
+      sendTokenResponse(safeUserData, authData.session, 201, res);
+    } catch (dbException) {
+      console.error('Database service exception:', dbException);
+      
+      // Clean up auth user if database service fails
+      try {
+        await supabase.auth.admin.deleteUser(authData.user.id);
+      } catch (cleanupError) {
+        console.error('Failed to cleanup auth user after DB exception:', cleanupError);
+      }
+      
+      return res.status(500).json({
+        success: false,
+        message: 'Database service unavailable',
+        errorCode: 'DATABASE_SERVICE_UNAVAILABLE'
+      });
+    }
   } catch (error) {
     console.error('Family registration error:', error);
     next(error);
