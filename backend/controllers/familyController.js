@@ -1,13 +1,8 @@
 const { createClient } = require('@supabase/supabase-js');
+const { getSupabase } = require('../config/database');
 const asyncHandler = require('../middleware/asyncHandler');
 const ErrorResponse = require('../utils/errorResponse');
 const geocoder = require('../utils/geocoder');
-
-// Initialize Supabase client
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
 
 // @desc    Get all families
 // @route   GET /api/families

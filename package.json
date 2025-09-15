@@ -1,6 +1,16 @@
 {
+  "name": "local-offers-agency",
+  "version": "1.0.0",
+  "description": "Local offers application with React Native frontend and Node.js backend",
+  "scripts": {
+    "start": "concurrently \"npm run start:backend\" \"npm run start:frontend\"",
+    "start:backend": "cd backend && npm start",
+    "start:frontend": "cd frontend/LocalOffersApp && npm start",
+    "install:all": "npm install && cd backend && npm install && cd ../frontend/LocalOffersApp && npm install"
+  },
   "dependencies": {
     "@supabase/mcp-server-supabase": "^0.5.3",
-    "@supabase/supabase-js": "^2.49.4"
+    "@supabase/supabase-js": "^2.49.4",
+    "concurrently": "^8.2.2"
   }
 }
